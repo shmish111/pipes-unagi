@@ -18,6 +18,7 @@ library
   exposed-modules:     Lib, Pipes.Unagi
   build-depends:       async
                      , base
+                     , lifted-async
                      , monadIO
                      , pipes
                      , transformers
