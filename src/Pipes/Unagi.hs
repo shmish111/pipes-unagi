@@ -3,7 +3,8 @@
 
 module Pipes.Unagi where
 
-import           Control.Concurrent.Async.Lifted (Async, async, poll, waitBoth)
+import           Control.Concurrent.Async.Lifted (Async, async, poll, wait,
+                                                  waitBoth)
 import           Control.Concurrent.Chan.Unagi   (InChan, OutChan, newChan,
                                                   readChan, writeChan)
 import           Control.Concurrent.MonadIO      (HasFork, MonadIO, fork,
@@ -16,12 +17,26 @@ import           Pipes                           (Consumer, Producer, await,
                                                   runEffect, yield, (>->))
 import qualified Pipes.Prelude                   as P
 
-combine ::
+-- | Convert an OutChan into a Producer. Once the OutChan produces 'Nothing', the Producer will close, returning ()
+newProducer :: (MonadIO m) => OutChan (Maybe a) -> Producer a m ()
+newProducer outChan = do
+  ma <- liftIO $ readChan outChan
+  case ma of
+    Just a -> do
+      yield a
+      newProducer outChan
+    Nothing -> return ()
+
+-- | Take 2 Producers and merge their outputs.
+--   There is no guarantee to the ordering.
+-- TODO: Exceptions:
+--   The return value is a tuple of the return values of each 'Producer' which can be an 'Exception' since we have to go into 'IO' and do things in parallel but if one 'Producer' throws an exception, we don't want to stop the other one. Or do we? Maybe we should cancel the other one.
+merge ::
      (MonadIO m, HasFork m, MonadBaseControl IO m)
   => Producer a m r
   -> Producer a m r
   -> Producer a m (Either SomeException r, Either SomeException r)
-combine p1 p2 = do
+merge p1 p2 = do
   (inChan, outChan) <- liftIO newChan
   a1 <- lift . async . runEffect $ p1 >-> consumer inChan
   a2 <- lift . async . runEffect $ p2 >-> consumer inChan
@@ -51,10 +66,9 @@ combine p1 p2 = do
           yield msg
           producer a1 a2 outChan
 
--- TODO: combineMany :: (MonadIO m, HasFork m) => [Producer a m r] -> Producer a m [r]
-testCombine :: IO ()
-testCombine = do
-  runEffect $ combine p1 p2 >-> pstdoutLn
+testMerge :: IO ()
+testMerge = do
+  runEffect $ merge p1 p2 >-> pstdoutLn
   pure ()
   where
     pstdoutLn =
@@ -68,16 +82,24 @@ testCombine = do
     p1 = P.replicateM 2 $ produce "a"
     p2 = P.replicateM 2 $ produce "b"
 
-replicateP ::
-     (MonadIO n, MonadBaseControl IO n)
-  => Producer a n r
-  -> n [Producer a n (Either SomeException r)]
-replicateP p = do
+-- | Create 2 Producers that both yield what the input Producer yields
+clone ::
+     (MonadIO m, MonadBaseControl IO m)
+  => Producer a m r
+  -> m (Producer a m r, Producer a m r)
+clone p = do
   (inChan1, outChan1) <- liftIO newChan
   (inChan2, outChan2) <- liftIO newChan
-  a <- async . runEffect $ p >-> consumer inChan1 inChan2
-  pure [producer a outChan1, producer a outChan2]
+  a <-
+    async $ do
+      r <- runEffect $ p >-> P.map Just >-> consumer inChan1 inChan2
+      runEffect $ produceNothing r >-> consumer inChan1 inChan2
+      pure r
+  pure (producer a outChan1, producer a outChan2)
   where
+    produceNothing v = do
+      yield Nothing
+      return v
     consumer :: (MonadIO m) => InChan a -> InChan a -> Consumer a m r
     consumer i1 i2 =
       forever $ do
@@ -87,37 +109,24 @@ replicateP p = do
     producer ::
          (MonadIO m, MonadBaseControl IO m)
       => Async (StM m r)
-      -> OutChan a
-      -> Producer a m (Either SomeException r)
+      -> OutChan (Maybe a)
+      -> Producer a m r
     producer a outChan = do
-      mv <- lift $ poll a
-      case mv of
-        Nothing -> do
-          liftIO $ putStrLn "nowt"
-          msg <- liftIO $ readChan outChan
+      mMsg <- liftIO $ readChan outChan
+      case mMsg of
+        Just msg -> do
           yield msg
           producer a outChan
-        Just v -> do
-          liftIO $ putStrLn "just"
-          msg <- liftIO $ readChan outChan
-          yield msg
+        Nothing -> do
+          v <- lift $ wait a
           pure v
 
-testReplicate :: IO ()
-testReplicate = do
-  [p1, p2] <- replicateP p
-  a1 <- async . void . runEffect $ p1 >-> consumer
-  a2 <- async . void . runEffect $ p2 >-> consumer
+testClone :: IO ()
+testClone = do
+  let p = P.replicateM 2 $ pure "a"
+  (p1, p2) <- clone p
+  a1 <- async . void . runEffect $ p1 >-> P.stdoutLn
+  a2 <- async . void . runEffect $ p2 >-> P.stdoutLn
   waitBoth a1 a2
   pure ()
-  where
-    produce c = do
-      liftIO $ threadDelay 1000000
-      pure c
-    p = P.replicateM 2 $ produce "a"
-    consumer =
-      forever $ do
-        esv <- await
-        liftIO $ print esv
--- TODO: this test isn't working properly
 -- TODO: write tests to check performance and compare to pipes-concurrency
